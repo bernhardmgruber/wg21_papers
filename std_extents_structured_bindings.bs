@@ -1,0 +1,289 @@
+<pre class='metadata'>
+Title: Structured bindings for <code>std::extents</code>
+Shortname: Dxxxx
+Revision: 0
+Status: D
+ED: http://wg21.link/Pxxxx
+Editor: Bernhard Manfred Gruber, CERN, <bernhardmgruber@gmail.com>
+Group: WG21
+Audience: LEWG
+Markup Shorthands: markdown yes
+Default Highlight: C++
+Abstract: This paper proposes to add support for structured bindings to <code>std::extents</code>.
+!Source: <a href="https://gist.github.com/bernhardmgruber/3d8c422e2cea2df542411623dd443ca4">GitHub</a>
+</pre>
+
+# Motivation and Scope
+
+[[P0009r18]] proposed `std::mdspan`, which was approved for C++23.
+It comes with the utility class template `std::extents` to describe the integral extents of a multidimensional index space.
+Practically, `std::extents` models an array of integrals, where some of the values can be specified at compile-time.
+However, `std::extents` behaves very little like an array.
+A notable missing feature are structured bindings, which would come in handy if the extents of the individual dimensions need to be extracted:
+
+<table>
+<tr><th>Before</th><th>After</th></tr>
+<tr>
+<td>
+```
+std::mdspan<double,
+    std::extents<I, I1, I2, I3>, L, A> mdspan;
+const auto& e = mdspan.extents();
+for (I z = 0; z < e.extent(2); z++)
+    for (I y = 0; y < e.extent(1); y++)
+        for (I x = 0; x < e.extent(0); x++)
+            mdspan[z, y, x] = 42.0;
+
+const auto total =
+    e.extent(0) * e.extent(1) * e.extent(2);
+```
+</td>
+<td>
+```
+std::mdspan<double,
+    std::extents<I, I1, I2, I3>, L, A> mdspan;
+const auto& [depth, height, width] = mdspan.extents();
+for (I z = 0; z < depth; z++)
+    for (I y = 0; y < height; y++)
+        for (I x = 0; x < width; x++)
+            mdspan[z, y, x] = 42.0;
+            
+const auto total =
+    width * height * depth;
+```
+</td>
+</table>
+
+Comparing before and after, the usability gain with structured bindings alone is marginal,
+but it allows us to use descriptive names for the extents to improve readability.
+
+The proposed feature is increasingly useful when structured bindings can introduce a pack,
+as proposed in [[P1061R4]] and shown below:
+
+<table>
+<tr><th>With P1061</th></tr>
+<tr>
+<td>
+```
+std::mdspan<double, std::extents<I, Is...>, L, A> mdspan;
+const auto& [...es] = mdspan.extents();
+for (const auto [...is] : std::views::cartesian_product(std::views::iota(0, es)...))
+    mdspan[is...] = 42.0;
+
+const auto total = (es * ...);
+```
+</td>
+</table>
+
+In this example, we trade readability for generality.
+Destructuring the extents into a pack allows us to expand the extents again into a series of `iota` views,
+which we can turn into the index space for `mdspan` using a `cartesian_product`.
+Notice, that the implementation is also rank agnostic,
+and for `std::layout_right` (`std::mdspan`'s default) iterates contiguously through memory.
+
+
+# Impact On the Standard
+
+This is a pure library extension.
+Destructuring `std::extents` in the current specification [[N4944]] is ill-formed,
+because `std::extents` stores its runtime extents in a private non-static data member, which is inaccessible to structured bindings.
+
+
+# Design Decisions
+
+## Handling static extents
+
+When destructuring `std::extents` we can deal with the compile-time/static extents in two ways:
+
+- Option A: Demote the compile-time/static extents to runtime values.
+- Option B: Retain the compile-time nature using e.g. `std::integral_constant`.
+
+Option A is arguably simpler and may be less surprising.
+The structured bindings just represent what the `extents(i)` member function would return.
+Option B retains the compile-time nature of static extents at the cost of imposing a mix of integers and `std::integral_constants` upon users.
+
+Regarding optimization potential, option A should rarely be a problem since structured bindings refer to a concrete instance of `std::extents` in scope,
+which is thus visible to the compiler.
+Using constant propagation, the compiler can likely determine the compile-time value that the structured bindings refer to.
+In the provided example implementation below, g++ 12.2 successfully unrolls the nested loops and transforms them into vector instructions.
+
+It's worthwhile to point out that `std::integral_constant` has a non-explicit conversion operator to its `value_type`,
+so it will be demoted automatically to a runtime value where needed (e.g. in all examples above).
+
+
+## Modification of extents
+
+Modifications of the values stored inside a `std::extents` should not be allowed,
+since it is neither possible in case of a static extent
+nor does it follow the design of `std::extents::extent(rank_type) -> index_type`, which returns by value.
+
+
+# Implementation Option A: demote static extents to runtime values
+
+One possible implementation is to use the tuple interface and delegate to `std::extents::extent(rank_type)`:
+
+```
+namespace std {
+template <size_t I, typename IndexType, size_t... Extents>
+    constexpr IndexType get(const extents<IndexType, Extents...>& e) noexcept {
+        return e.extent(I);
+    }
+}
+
+template <typename IndexType, std::size_t... Extents>
+struct std::tuple_size<std::extents<IndexType, Extents...>>
+    : std::integral_constant<std::size_t, sizeof...(Extents)> {};
+
+template <std::size_t I, typename IndexType, std::size_t... Extents>
+struct std::tuple_element<I, std::extents<IndexType, Extents...>> {
+    using type = IndexType;
+};
+```
+An example of such an implementation using the Kokkos reference implementation of `std::mdspan` on Godbolt is provided here:
+[https://godbolt.org/z/zo5Wb6TMG](https://godbolt.org/z/zo5Wb6TMG).
+
+
+# Implementation Option B: retaining static extents
+
+One possible implementation is to use the tuple interface and query the extents type whether a specific extent is static or not.
+Depending on this information, either the runtime extent via `std::extents::extent(I)` or a `std::integral_constant` of the appropriate index type and static extent is returned:
+
+```
+namespace std {
+    template <size_t I, typename IndexType, size_t... Extents>
+    constexpr auto get(const extents<IndexType, Extents...>& e) noexcept {
+        if constexpr (extents<IndexType, Extents...>::static_extent(I) == dynamic_extent)
+            return e.extent(I);
+        else
+            return integral_constant<IndexType,
+                static_cast<IndexType>(
+                    extents<IndexType, Extents...>::static_extent(I))>{};
+    }
+}
+
+template <typename IndexType, std::size_t... Extents>
+struct std::tuple_size<std::extents<IndexType, Extents...>>
+    : std::integral_constant<std::size_t, sizeof...(Extents)> {};
+
+template <std::size_t I, typename IndexType, std::size_t... Extents>
+struct std::tuple_element<I, std::extents<IndexType, Extents...>> {
+    using type = decltype(std::get<I>(std::extents<IndexType, Extents...>{}));
+};
+```
+
+An example of such an implementation using the Kokkos reference implementation of `std::mdspan` on Godbolt is provided here:
+[https://godbolt.org/z/841PeWM18](https://godbolt.org/z/841PeWM18).
+
+
+# Polls
+
+The author would like to seek guidance on whether structured bindings for `std::extents` are perceived as useful and
+whether to continue with this proposal.
+And if yes, whether implementation Option A or Option B is preferred.
+
+# Wording
+
+TODO
+
+<div style="display:none">
+Add the following to [mdspan.extents.overview] after the deduction guide for `std::extents`:
+
+<!-- See section on mdspan extents overview here: https://eel.is/c++draft/mdspan.extents.overview -->
+
+```
+  // [mdspan.extents.tuple], tuple interface
+  template<class T> struct tuple_size;
+  template<size_t I, class T> struct tuple_element;
+  template <class IndexType, size_t... Extents>
+    struct tuple_size<extents<IndexType, Extents...>>;
+  template <size_t I, class IndexType, size_t... Extents>
+    struct tuple_element<I, extents<IndexType, Extents...>>;
+  template <size_t I, class IndexType, size_t... Extents>
+    constexpr IndexType get(const extents<IndexType, Extents...>& e) noexcept;
+```
+
+Add a new section after [mdspan.extents.dextents]:
+
+<!-- See section on mdspan extents here: https://eel.is/c++draft/mdspan.extents -->
+
+24.7.3.3.7 Tuple interface [mdspan.extents.tuple]
+
+<!-- wording based on https://eel.is/c++draft/array.tuple#:array,tuple_interface_to -->
+
+```
+template <class IndexType, size_t... Extents>
+  struct tuple_size<extents<IndexType, Extents...>> : integral_constant<size_t, sizeof...(Extents)> { };
+```
+
+```
+template <size_t I, class IndexType, size_t... Extents>
+  struct tuple_element<I, extents<IndexType, Extents...>> {
+    using type = IndexType;
+  };
+```
+
+> *Mandates*: `I < sizeof...(Extents)` is `true`.
+
+```
+template <size_t I, class IndexType, size_t... Extents>
+  constexpr IndexType get(const extents<IndexType, Extents...>& e) noexcept;
+```
+
+> *Mandates*: `I < sizeof...(Extents)` is `true`.
+
+> *Returns*: `e.extent(I)`
+</div>
+## Feature-test macro
+
+Add the following macro definition to 17.3.2 [version.syn], Header `<version>` synopsis, with the value selected by the editor to reflect the date of adoption of this paper:
+
+```
+#define __cpp_lib_extents_structured_bindings 20XXXXL // also in <mdspan>
+```
+
+# Acknowledgements
+
+I would like to thank Mark Hoemmen and Christan Trott for encouraging me to write this proposal,
+Mark Hoemmen for suggesting implementation B,
+and Michael Hava for reviewing.
+
+<pre class=biblio>
+{
+    "P0009r18": {
+        "title": "MDSPAN",
+        "authors": [
+            "Christian Trott",
+            "D.S. Hollman",
+            "Damien Lebrun-Grandie",
+            "Mark Hoemmen",
+            "Daniel Sunderland",
+            "H. Carter Edwards",
+            "Bryce Adelstein Lelbach",
+            "Mauro Bianco",
+            "Ben Sander",
+            "Athanasios Iliopoulos",
+            "John Michopoulos",
+            "Nevin Liber"
+        ],
+        "href": "https://wg21.link/P0009r18",
+        "date": "2022-07-13"
+    },
+    "P1061R4": {
+        "title": "Structured Bindings can introduce a Pack",
+        "authors": [
+            "Barry Revzin",
+            "Jonathan Wakely"
+        ],
+        "href": "https://wg21.link/P1061R4",
+        "date": "2023-02-14"
+    },
+    "N4944": {
+        "title": "Working Draft, Standard for Programming Language C++",
+        "authors": [
+            "Thomas Köppe"
+        ],
+        "href": "https://wg21.link/N4944",
+        "date": "2023-03-19"
+    }
+}
+</pre>
