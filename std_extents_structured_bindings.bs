@@ -10,7 +10,7 @@ Audience: LEWG
 Markup Shorthands: markdown yes
 Default Highlight: C++
 Abstract: This paper proposes to add support for structured bindings to <code>std::extents</code>.
-!Source: <a href="https://gist.github.com/bernhardmgruber/3d8c422e2cea2df542411623dd443ca4">GitHub</a>
+!Source: <a href="https://github.com/bernhardmgruber/wg21_papers/blob/main/std_extents_structured_bindings.bs">GitHub</a>
 </pre>
 
 # Motivation and Scope
