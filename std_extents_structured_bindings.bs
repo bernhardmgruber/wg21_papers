@@ -1,9 +1,9 @@
 <pre class='metadata'>
 Title: Structured bindings for <code>std::extents</code>
-Shortname: Dxxxx
+Shortname: P2906
 Revision: 0
-Status: D
-ED: http://wg21.link/Pxxxx
+Status: P
+URL: http://wg21.link/P2906
 Editor: Bernhard Manfred Gruber, CERN, <bernhardmgruber@gmail.com>
 Group: WG21
 Audience: LEWG
